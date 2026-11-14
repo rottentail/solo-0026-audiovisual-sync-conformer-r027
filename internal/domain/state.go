@@ -16,6 +16,15 @@ const (
 	ConformStateFailed     = "failed"
 )
 
+const (
+	DecisionSourceAutomatic = "automatic"
+	DecisionSourceManual    = "manual"
+)
+
+func ValidDecisionSource(source string) bool {
+	return source == DecisionSourceAutomatic || source == DecisionSourceManual
+}
+
 func CanAdmitTake(next string) bool {
 	return next == TakeStateAdmitted
 }

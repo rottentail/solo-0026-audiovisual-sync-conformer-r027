@@ -180,6 +180,9 @@ func (s *Service) CreateConform(
 	if err := domain.ValidateIdentifier("analysis_id", analysisID); err != nil {
 		return domain.ConformResult{}, err
 	}
+	if input.DecisionSource == "" {
+		input.DecisionSource = domain.DecisionSourceAutomatic
+	}
 	if err := domain.ValidateCreateConform(input); err != nil {
 		return domain.ConformResult{}, err
 	}
@@ -195,13 +198,27 @@ func (s *Service) CreateConform(
 			analysisID,
 		)
 	}
+	take, err := s.repository.GetTake(analysis.TakeID)
+	if err != nil {
+		return domain.ConformResult{}, err
+	}
+	measuredOffset := *analysis.OffsetMS
+	decidedOffset := measuredOffset
+	if input.DecisionSource == domain.DecisionSourceManual {
+		decidedOffset = *input.ManualOffsetMS
+	}
 	record := domain.ConformJob{
 		ID:               input.ConformID,
 		AnalysisID:       analysis.ID,
 		TakeID:           analysis.TakeID,
 		State:            domain.ConformStateQueued,
+		DecisionSource:   input.DecisionSource,
 		MaxCorrectionMS:  input.MaxCorrectionMS,
-		MeasuredOffsetMS: *analysis.OffsetMS,
+		MeasuredOffsetMS: measuredOffset,
+		ManualOffsetMS:   input.ManualOffsetMS,
+		DecidedOffsetMS:  decidedOffset,
+		InputAudioDigest: take.Audio.Digest,
+		InputVideoDigest: take.Video.Digest,
 		CreatedAt:        time.Now().UTC(),
 		UpdatedAt:        time.Now().UTC(),
 	}
@@ -212,12 +229,12 @@ func (s *Service) CreateConform(
 	if !created {
 		return domain.ConformResult{Conform: existing, Created: false}, nil
 	}
-	if abs(record.MeasuredOffsetMS) > record.MaxCorrectionMS {
+	if abs(record.DecidedOffsetMS) > record.MaxCorrectionMS {
 		record.State = domain.ConformStateFailed
 		record.ErrorCode = "correction_limit_exceeded"
 		record.ErrorMessage = fmt.Sprintf(
-			"measured correction of %d ms exceeds the ceiling of %d ms",
-			abs(record.MeasuredOffsetMS),
+			"decided correction of %d ms exceeds the ceiling of %d ms",
+			abs(record.DecidedOffsetMS),
 			record.MaxCorrectionMS,
 		)
 		record.UpdatedAt = time.Now().UTC()
@@ -243,7 +260,21 @@ func (s *Service) renderConform(record domain.ConformJob) (domain.ConformResult,
 	if err != nil {
 		return s.failConform(record, "take_media_unavailable", err.Error())
 	}
-	alignedAudio, err := media.AlignAudio(audio, record.MeasuredOffsetMS, record.MaxCorrectionMS)
+	if media.DigestBytes(audio) != record.InputAudioDigest {
+		return s.failConform(
+			record,
+			"input_media_changed",
+			"stored audio bytes no longer match the digest pinned by this conform",
+		)
+	}
+	if media.DigestBytes(video) != record.InputVideoDigest {
+		return s.failConform(
+			record,
+			"input_media_changed",
+			"stored picture bytes no longer match the digest pinned by this conform",
+		)
+	}
+	alignedAudio, err := media.AlignAudio(audio, record.DecidedOffsetMS, record.MaxCorrectionMS)
 	if err != nil {
 		return s.failConform(record, domain.AsError(err).Code, domain.AsError(err).Message)
 	}
@@ -255,16 +286,26 @@ func (s *Service) renderConform(record domain.ConformJob) (domain.ConformResult,
 	if err != nil {
 		return s.failConform(record, "take_media_unavailable", err.Error())
 	}
-	record.AppliedOffsetMS = record.MeasuredOffsetMS
+	if take.Audio.Digest != record.InputAudioDigest || take.Video.Digest != record.InputVideoDigest {
+		return s.failConform(
+			record,
+			"input_media_changed",
+			"take record no longer matches the media digests pinned by this conform",
+		)
+	}
+	record.AppliedOffsetMS = record.DecidedOffsetMS
 	record.AppliedSamples = alignedAudio.AppliedSamples
 	record.AudioOutputDigest = alignedAudio.Digest
 	record.VideoOutputDigest = videoInfo.Digest
 	receipt := domain.ConformReceipt{
-		SchemaVersion:    1,
+		SchemaVersion:    2,
 		ConformID:        record.ID,
 		AnalysisID:       record.AnalysisID,
 		TakeID:           record.TakeID,
+		DecisionSource:   record.DecisionSource,
 		MeasuredOffsetMS: record.MeasuredOffsetMS,
+		ManualOffsetMS:   record.ManualOffsetMS,
+		DecidedOffsetMS:  record.DecidedOffsetMS,
 		AppliedOffsetMS:  record.AppliedOffsetMS,
 		AppliedSamples:   record.AppliedSamples,
 		AudioDigest:      alignedAudio.Digest,

@@ -103,6 +103,27 @@
         "media",
         "storage"
       ]
+    },
+    {
+      "id": "manual-conform",
+      "name": "Submit manual lip-sync correction",
+      "entry": "POST /v1/sync-analyses/{analysis_id}/conforms (decision_source=manual)",
+      "steps": [
+        "Keep the ready analysis and its measured offset immutable",
+        "Create a separate conform job recording measured basis and manual decision",
+        "Pin and verify the take audio and picture digests before rendering",
+        "Reject identical-id retries that change the decision or input media"
+      ],
+      "success": "Returns a distinct completed manual bundle whose receipt separates the measured basis from the applied movement.",
+      "failure": "Returns a stable validation, conflict, or correction-limit error and leaves the analysis and prior bundles untouched.",
+      "verification": "The manual check renders automatic and manual bundles, verifies the applied movement and receipt fields, confirms the automatic bundle stays byte-identical, and exercises idempotent and conflicting retries.",
+      "module_ids": [
+        "httpapi",
+        "service",
+        "domain",
+        "media",
+        "storage"
+      ]
     }
   ]
 }

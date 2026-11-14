@@ -235,13 +235,20 @@ func (r *Repository) CreateConform(record domain.ConformJob) (domain.ConformJob,
 	switch {
 	case err == nil:
 		if existing.AnalysisID == record.AnalysisID &&
-			existing.MaxCorrectionMS == record.MaxCorrectionMS {
+			existing.TakeID == record.TakeID &&
+			existing.MaxCorrectionMS == record.MaxCorrectionMS &&
+			existing.DecisionSource == record.DecisionSource &&
+			manualOffsetEqual(existing.ManualOffsetMS, record.ManualOffsetMS) &&
+			existing.MeasuredOffsetMS == record.MeasuredOffsetMS &&
+			existing.DecidedOffsetMS == record.DecidedOffsetMS &&
+			existing.InputAudioDigest == record.InputAudioDigest &&
+			existing.InputVideoDigest == record.InputVideoDigest {
 			return existing, false, nil
 		}
 		return domain.ConformJob{}, false, domain.NewError(
 			"conform_conflict",
 			409,
-			"conform %s already exists with a different analysis or correction ceiling",
+			"conform %s already exists with a different decision, analysis, or input media",
 			record.ID,
 		)
 	case !domain.IsErrorCode(err, "conform_not_found"):
@@ -361,6 +368,13 @@ func (r *Repository) ReadConformBundle(id string) ([]byte, domain.ConformReceipt
 
 func (r *Repository) writeConform(record domain.ConformJob) error {
 	return writeJSON(r.conformPath(record.ID), record)
+}
+
+func manualOffsetEqual(existing, requested *int) bool {
+	if existing == nil || requested == nil {
+		return existing == requested
+	}
+	return *existing == *requested
 }
 
 func writeJSON(path string, value any) error {

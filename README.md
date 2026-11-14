@@ -105,13 +105,56 @@ event.
 ```json
 {
   "conform_id": "review-a",
-  "max_correction_ms": 250
+  "max_correction_ms": 250,
+  "decision_source": "automatic"
 }
 ```
 
 The audio is aligned earlier for a positive measured offset and later for a
 negative offset. The request fails with `correction_limit_exceeded` when the
 measured correction is larger than `max_correction_ms`.
+
+`decision_source` is `automatic` by default and may be omitted. An automatic
+conform applies the offset measured by the immutable analysis, so its
+`measured_offset_ms`, `decided_offset_ms`, and `applied_offset_ms` are equal.
+
+### Render a manual lip-sync correction
+
+An editor who reads the actual lip movement can submit a separate review
+bundle driven by a human decision instead of the detected offset:
+
+```json
+{
+  "conform_id": "review-a-manual",
+  "max_correction_ms": 250,
+  "decision_source": "manual",
+  "manual_offset_ms": -40
+}
+```
+
+The sign convention is unchanged: a positive offset means audio is late, so a
+positive correction moves the audio earlier. A manual request requires
+`manual_offset_ms` (zero is allowed) and rejects any value beyond
+`max_correction_ms` or the 5000 ms hard bound.
+
+A manual decision never rewrites the analysis or any existing conform. It
+creates a new conform job under its own `conform_id`, and the analysis keeps
+its measured event times and offset. Every conform record and receipt keeps
+the basis and the movement separately readable:
+
+- `decision_source`: `automatic` or `manual`;
+- `measured_offset_ms`: the automatic detection result, always preserved;
+- `manual_offset_ms`: present only for a manual decision;
+- `decided_offset_ms`: the value actually used (`measured` for automatic,
+  `manual` for manual);
+- `applied_offset_ms` and `applied_samples`: the actual audio movement;
+- `input_audio_digest` / `input_video_digest`: the exact source media the
+  bundle was rendered from.
+
+Repeating an identical request returns the existing record with HTTP 200.
+Reusing a `conform_id` with a different decision, correction ceiling,
+analysis, or pinned input media returns `conform_conflict`; the stored audio
+can never be silently swapped underneath a delivery request.
 
 ### Read a conform
 
@@ -126,6 +169,10 @@ audio-aligned.wav
 video-conformed.y4m
 conform-receipt.json
 ```
+
+The receipt (schema version 2) carries the same decision fields as the conform
+record, so an operator inspecting either the API record or the ZIP can tell
+which offset was the measured basis and which value actually moved the audio.
 
 ## Data layout
 
@@ -168,6 +215,7 @@ Run one workflow at a time:
 go run ./cmd/syncflowcheck -workflow admit-take
 go run ./cmd/syncflowcheck -workflow analyze-sync
 go run ./cmd/syncflowcheck -workflow render-conform
+go run ./cmd/syncflowcheck -workflow manual-conform
 ```
 
 Each check starts the real loopback HTTP service, generates a bounded

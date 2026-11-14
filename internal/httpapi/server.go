@@ -32,6 +32,8 @@ type createAnalysisRequest struct {
 type createConformRequest struct {
 	ConformID       string `json:"conform_id"`
 	MaxCorrectionMS *int   `json:"max_correction_ms"`
+	DecisionSource  string `json:"decision_source"`
+	ManualOffsetMS  *int   `json:"manual_offset_ms"`
 }
 
 func New(service *appservice.Service) *API {
@@ -137,9 +139,15 @@ func (api *API) createConform(w http.ResponseWriter, request *http.Request) {
 	if payload.MaxCorrectionMS != nil {
 		maxCorrectionMS = *payload.MaxCorrectionMS
 	}
+	decisionSource := payload.DecisionSource
+	if decisionSource == "" {
+		decisionSource = domain.DecisionSourceAutomatic
+	}
 	result, err := api.service.CreateConform(request.PathValue("analysis_id"), domain.CreateConformInput{
 		ConformID:       payload.ConformID,
 		MaxCorrectionMS: maxCorrectionMS,
+		DecisionSource:  decisionSource,
+		ManualOffsetMS:  payload.ManualOffsetMS,
 	})
 	if err != nil {
 		writeFailure(w, err)

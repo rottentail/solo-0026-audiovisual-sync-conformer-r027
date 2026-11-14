@@ -48,15 +48,35 @@ analysis stores one stable error code and never exposes a usable event pair.
 ### Conform job
 
 A `ConformJob` belongs to one ready analysis. It corrects the audio by the
-inverse of the measured offset while preserving picture frame order and Y4M
-geometry. The job commits a ZIP bundle containing:
+inverse of a decided offset while preserving picture frame order and Y4M
+geometry. A job is driven by one of two decision sources:
+
+- `automatic`: the decided offset is the analysis's measured offset;
+- `manual`: an editor supplies a signed `manual_offset_ms` from a lip-sync
+  review, which becomes the decided offset.
+
+The measured offset always remains on the record as the detection basis, even
+for a manual job. The record separates:
+
+- `measured_offset_ms`: the immutable automatic detection result;
+- `manual_offset_ms`: the editor's value, present only for manual jobs;
+- `decided_offset_ms`: the value chosen for this job;
+- `applied_offset_ms` and `applied_samples`: the movement actually applied to
+  the audio.
+
+It also pins `input_audio_digest` and `input_video_digest` from the admitted
+take at creation and re-verifies the stored bytes before rendering, so a
+retry can never silently align a different audio payload. The job commits a
+ZIP bundle containing:
 
 - `audio-aligned.wav`;
 - `video-conformed.y4m`;
 - `conform-receipt.json`.
 
-The completed receipt digest and byte count always match the visible ZIP.
-Failed jobs never expose a bundle route.
+The completed receipt digest and byte count always match the visible ZIP. The
+receipt is schema version 2 and repeats the decision source, measured basis,
+manual value (when present), decided offset, and applied movement. Failed
+jobs never expose a bundle route.
 
 ## State machines
 
@@ -127,13 +147,37 @@ Failure records a stable code such as `sync_detection_failed`.
 Entry point: `POST /v1/sync-analyses/{analysis_id}/conforms`
 
 1. Require a ready analysis and enforce the requested correction ceiling.
-2. Align audio samples by the inverse measured offset.
-3. Re-emit the Y4M header and frames with validated geometry.
-4. Build the receipt, ZIP bundle, and digests in a temporary directory.
-5. Commit the directory atomically and complete the job.
+2. Pin the admitted take's audio and picture digests onto the new job.
+3. For an automatic decision, choose the measured offset; for a manual
+   decision, require and choose `manual_offset_ms`.
+4. Re-verify the stored media bytes against the pinned digests.
+5. Align audio samples by the inverse decided offset.
+6. Re-emit the Y4M header and frames with validated geometry.
+7. Build the receipt, ZIP bundle, and digests in a temporary directory.
+8. Commit the directory atomically and complete the job.
 
-Success returns a completed job whose receipt and bundle routes agree. Failure
-returns a terminal job with a stable error code and no readable bundle.
+Success returns a completed job whose receipt and bundle routes agree.
+Failure returns a terminal job with a stable error code and no readable
+bundle. The ready analysis and every previously completed bundle are
+immutable inputs to this workflow and are never rewritten.
+
+### 4. Submit a manual lip-sync correction
+
+Entry point: `POST /v1/sync-analyses/{analysis_id}/conforms`
+with `decision_source` set to `manual`.
+
+1. Require a ready analysis; its measured event pair and offset stay intact.
+2. Require a finite `manual_offset_ms` within the correction ceiling and the
+   5000 ms hard bound.
+3. Create a separate conform job under a new `conform_id` that records both
+   the measured basis and the editor's decision.
+4. Render and commit the manual bundle through the same atomic pipeline as an
+   automatic job.
+
+An identical retry returns the existing job. Reusing a `conform_id` with a
+different decision source, manual value, ceiling, analysis, or pinned input
+digest returns `conform_conflict` instead of replacing the prior delivery.
+The analysis record and automatic bundles remain byte-identical.
 
 ## Modules
 
@@ -186,7 +230,7 @@ interfaces below:
 - terminal-state behavior for invalid and boundary requests;
 - atomic visibility of take directories and conform bundles.
 
-Until that stage, three bounded production workflow checks exercise the real
+Until that stage, four bounded production workflow checks exercise the real
 HTTP routes, storage layout, media transforms, and persisted terminal records.
 They are not a substitute for the later test suite.
 

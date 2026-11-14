@@ -51,6 +51,8 @@ func main() {
 		err = runAnalyzeCheck(ctx)
 	case "render-conform":
 		err = runRenderCheck(ctx)
+	case "manual-conform":
+		err = runManualConformCheck(ctx)
 	default:
 		err = fmt.Errorf("unknown workflow %q", *workflow)
 	}
@@ -314,6 +316,290 @@ func runRenderCheck(ctx *checkContext) error {
 	}
 	if response.StatusCode != http.StatusConflict {
 		return fmt.Errorf("failed correction exposed a bundle: %d %s", response.StatusCode, body)
+	}
+	return nil
+}
+
+func runManualConformCheck(ctx *checkContext) error {
+	if err := admitTake(ctx, "manual-take-01"); err != nil {
+		return err
+	}
+	if err := createAnalysis(ctx, "manual-take-01", "manual-analysis-01"); err != nil {
+		return err
+	}
+
+	// The automatic analysis record stays intact and available.
+	response, body, err := ctx.requestJSON(http.MethodGet, "/v1/sync-analyses/manual-analysis-01", nil)
+	if err != nil {
+		return err
+	}
+	if response.StatusCode != http.StatusOK {
+		return fmt.Errorf("analysis read returned %d: %s", response.StatusCode, body)
+	}
+	var analysis domain.SyncAnalysis
+	if err := json.Unmarshal(body, &analysis); err != nil {
+		return fmt.Errorf("decode analysis: %w", err)
+	}
+	if analysis.State != domain.AnalysisStateReady || analysis.OffsetMS == nil || *analysis.OffsetMS != 125 {
+		return fmt.Errorf("automatic analysis changed after a manual decision")
+	}
+
+	// Render the automatic bundle first so manual work cannot rewrite it.
+	response, body, err = ctx.requestJSON(
+		http.MethodPost,
+		"/v1/sync-analyses/manual-analysis-01/conforms",
+		map[string]any{
+			"conform_id":        "auto-review-01",
+			"max_correction_ms": 500,
+			"decision_source":   "automatic",
+		},
+	)
+	if err != nil {
+		return err
+	}
+	if response.StatusCode != http.StatusCreated {
+		return fmt.Errorf("automatic conform returned %d: %s", response.StatusCode, body)
+	}
+	var autoConform domain.ConformJob
+	if err := json.Unmarshal(body, &autoConform); err != nil {
+		return fmt.Errorf("decode automatic conform: %w", err)
+	}
+	if autoConform.DecisionSource != domain.DecisionSourceAutomatic ||
+		autoConform.MeasuredOffsetMS != 125 || autoConform.DecidedOffsetMS != 125 ||
+		autoConform.AppliedOffsetMS != 125 || autoConform.InputAudioDigest == "" {
+		return fmt.Errorf("automatic conform does not separate basis from movement: %+v", autoConform)
+	}
+	autoBundleDigest := autoConform.BundleDigest
+
+	// A separate manual bundle uses the operator's lip-sync decision while the
+	// measured offset remains visible as the actual basis.
+	manualOffset := -40
+	response, body, err = ctx.requestJSON(
+		http.MethodPost,
+		"/v1/sync-analyses/manual-analysis-01/conforms",
+		map[string]any{
+			"conform_id":        "manual-review-01",
+			"max_correction_ms": 500,
+			"decision_source":   "manual",
+			"manual_offset_ms":  manualOffset,
+		},
+	)
+	if err != nil {
+		return err
+	}
+	if response.StatusCode != http.StatusCreated {
+		return fmt.Errorf("manual conform returned %d: %s", response.StatusCode, body)
+	}
+	var manualConform domain.ConformJob
+	if err := json.Unmarshal(body, &manualConform); err != nil {
+		return fmt.Errorf("decode manual conform: %w", err)
+	}
+	if manualConform.DecisionSource != domain.DecisionSourceManual {
+		return fmt.Errorf("manual conform source is %q", manualConform.DecisionSource)
+	}
+	if manualConform.MeasuredOffsetMS != 125 {
+		return fmt.Errorf("manual conform lost the measured basis: %d", manualConform.MeasuredOffsetMS)
+	}
+	if manualConform.ManualOffsetMS == nil || *manualConform.ManualOffsetMS != manualOffset {
+		return fmt.Errorf("manual conform did not record the operator offset: %v", manualConform.ManualOffsetMS)
+	}
+	if manualConform.DecidedOffsetMS != manualOffset || manualConform.AppliedOffsetMS != manualOffset {
+		return fmt.Errorf("manual conform applied %d instead of the decided %d",
+			manualConform.AppliedOffsetMS, manualConform.DecidedOffsetMS)
+	}
+	if manualConform.InputAudioDigest != autoConform.InputAudioDigest {
+		return fmt.Errorf("manual and automatic conforms pin different audio")
+	}
+	if manualConform.BundleDigest == "" || manualConform.BundleDigest == autoBundleDigest {
+		return fmt.Errorf("manual bundle is not a distinct artifact")
+	}
+
+	response, bundle, err := ctx.requestJSON(http.MethodGet, "/v1/conforms/manual-review-01/bundle", nil)
+	if err != nil {
+		return err
+	}
+	if response.StatusCode != http.StatusOK {
+		return fmt.Errorf("manual bundle read returned %d: %s", response.StatusCode, bundle)
+	}
+	entries, err := readZip(bundle)
+	if err != nil {
+		return err
+	}
+	var receipt domain.ConformReceipt
+	if err := json.Unmarshal(entries["conform-receipt.json"], &receipt); err != nil {
+		return fmt.Errorf("decode manual receipt: %w", err)
+	}
+	if receipt.SchemaVersion != 2 ||
+		receipt.DecisionSource != domain.DecisionSourceManual ||
+		receipt.MeasuredOffsetMS != 125 ||
+		receipt.ManualOffsetMS == nil || *receipt.ManualOffsetMS != manualOffset ||
+		receipt.DecidedOffsetMS != manualOffset ||
+		receipt.AppliedOffsetMS != manualOffset {
+		return fmt.Errorf("manual receipt does not separate basis and movement: %+v", receipt)
+	}
+	aligned, err := media.AnalyzeSync(entries["audio-aligned.wav"], entries["video-conformed.y4m"])
+	if err != nil {
+		return fmt.Errorf("analyze manual bundle: %w", err)
+	}
+	// A -40 ms correction moves the original +125 ms residual toward +165 ms,
+	// proving the actual movement matches the manual value rather than 125.
+	if aligned.OffsetMS < 160 || aligned.OffsetMS > 170 {
+		return fmt.Errorf("manual movement is wrong, residual offset %d ms", aligned.OffsetMS)
+	}
+
+	// The previously completed automatic bundle is byte-identical and still served.
+	response, autoBundleNow, err := ctx.requestJSON(http.MethodGet, "/v1/conforms/auto-review-01/bundle", nil)
+	if err != nil {
+		return err
+	}
+	if response.StatusCode != http.StatusOK {
+		return fmt.Errorf("automatic bundle no longer readable: %d", response.StatusCode)
+	}
+	if media.DigestBytes(autoBundleNow) != autoBundleDigest {
+		return fmt.Errorf("automatic bundle was rewritten by the manual decision")
+	}
+	response, body, err = ctx.requestJSON(http.MethodGet, "/v1/conforms/auto-review-01", nil)
+	if err != nil {
+		return err
+	}
+	var autoReadback domain.ConformJob
+	if err := json.Unmarshal(body, &autoReadback); err != nil {
+		return fmt.Errorf("decode automatic readback: %w", err)
+	}
+	if autoReadback.State != domain.ConformStateCompleted ||
+		autoReadback.AppliedOffsetMS != 125 ||
+		autoReadback.DecisionSource != domain.DecisionSourceAutomatic {
+		return fmt.Errorf("completed automatic conform was modified")
+	}
+
+	// An identical manual request retries to the same record instead of rebuilding.
+	response, body, err = ctx.requestJSON(
+		http.MethodPost,
+		"/v1/sync-analyses/manual-analysis-01/conforms",
+		map[string]any{
+			"conform_id":        "manual-review-01",
+			"max_correction_ms": 500,
+			"decision_source":   "manual",
+			"manual_offset_ms":  manualOffset,
+		},
+	)
+	if err != nil {
+		return err
+	}
+	if response.StatusCode != http.StatusOK {
+		return fmt.Errorf("identical manual retry returned %d: %s", response.StatusCode, body)
+	}
+	var retried domain.ConformJob
+	if err := json.Unmarshal(body, &retried); err != nil {
+		return fmt.Errorf("decode retried conform: %w", err)
+	}
+	if retried.BundleDigest != manualConform.BundleDigest {
+		return fmt.Errorf("identical retry rebuilt or switched the bundle")
+	}
+
+	// Reusing the same delivery id with a different manual value is a conflict,
+	// not a silent replacement of audio/decision.
+	response, body, err = ctx.requestJSON(
+		http.MethodPost,
+		"/v1/sync-analyses/manual-analysis-01/conforms",
+		map[string]any{
+			"conform_id":        "manual-review-01",
+			"max_correction_ms": 500,
+			"decision_source":   "manual",
+			"manual_offset_ms":  -90,
+		},
+	)
+	if err != nil {
+		return err
+	}
+	if response.StatusCode != http.StatusConflict || errorCode(body) != "conform_conflict" {
+		return fmt.Errorf("changed manual retry returned %d: %s", response.StatusCode, body)
+	}
+
+	// Reusing the same id across automatic and manual decisions is also rejected.
+	response, body, err = ctx.requestJSON(
+		http.MethodPost,
+		"/v1/sync-analyses/manual-analysis-01/conforms",
+		map[string]any{
+			"conform_id":        "manual-review-01",
+			"max_correction_ms": 500,
+			"decision_source":   "automatic",
+		},
+	)
+	if err != nil {
+		return err
+	}
+	if response.StatusCode != http.StatusConflict || errorCode(body) != "conform_conflict" {
+		return fmt.Errorf("decision-source switch returned %d: %s", response.StatusCode, body)
+	}
+
+	// A manual correction beyond the per-request ceiling fails terminally and
+	// never exposes a bundle.
+	response, body, err = ctx.requestJSON(
+		http.MethodPost,
+		"/v1/sync-analyses/manual-analysis-01/conforms",
+		map[string]any{
+			"conform_id":        "manual-too-large-01",
+			"max_correction_ms": 25,
+			"decision_source":   "manual",
+			"manual_offset_ms":  200,
+		},
+	)
+	if err != nil {
+		return err
+	}
+	if response.StatusCode != http.StatusUnprocessableEntity || errorCode(body) != "correction_limit_exceeded" {
+		return fmt.Errorf("oversized manual correction returned %d: %s", response.StatusCode, body)
+	}
+	response, body, err = ctx.requestJSON(http.MethodGet, "/v1/conforms/manual-too-large-01/bundle", nil)
+	if err != nil {
+		return err
+	}
+	if response.StatusCode != http.StatusConflict {
+		return fmt.Errorf("failed manual conform exposed a bundle: %d %s", response.StatusCode, body)
+	}
+
+	// Invalid decision payloads are rejected before any record is created.
+	response, body, err = ctx.requestJSON(
+		http.MethodPost,
+		"/v1/sync-analyses/manual-analysis-01/conforms",
+		map[string]any{
+			"conform_id":      "manual-invalid-01",
+			"decision_source": "manual",
+		},
+	)
+	if err != nil {
+		return err
+	}
+	if response.StatusCode != http.StatusBadRequest || errorCode(body) != "invalid_request" {
+		return fmt.Errorf("manual request without offset returned %d: %s", response.StatusCode, body)
+	}
+	response, body, err = ctx.requestJSON(
+		http.MethodPost,
+		"/v1/sync-analyses/manual-analysis-01/conforms",
+		map[string]any{
+			"conform_id":       "manual-invalid-02",
+			"decision_source":  "guesswork",
+			"manual_offset_ms": 10,
+		},
+	)
+	if err != nil {
+		return err
+	}
+	if response.StatusCode != http.StatusBadRequest || errorCode(body) != "invalid_request" {
+		return fmt.Errorf("unknown decision source returned %d: %s", response.StatusCode, body)
+	}
+
+	// The automatic analysis remains terminal and untouched after every decision.
+	response, body, err = ctx.requestJSON(http.MethodGet, "/v1/sync-analyses/manual-analysis-01", nil)
+	if err != nil {
+		return err
+	}
+	if err := json.Unmarshal(body, &analysis); err != nil {
+		return fmt.Errorf("decode final analysis: %w", err)
+	}
+	if analysis.State != domain.AnalysisStateReady || analysis.OffsetMS == nil || *analysis.OffsetMS != 125 {
+		return fmt.Errorf("analysis was rewritten by conform decisions")
 	}
 	return nil
 }

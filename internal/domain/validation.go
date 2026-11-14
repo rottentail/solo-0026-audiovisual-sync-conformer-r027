@@ -68,5 +68,53 @@ func ValidateCreateConform(input CreateConformInput) error {
 			MaxCorrectionMS,
 		)
 	}
+	if input.DecisionSource == "" {
+		return NewError("invalid_request", 400, "decision_source is required")
+	}
+	if !ValidDecisionSource(input.DecisionSource) {
+		return NewError(
+			"invalid_request",
+			400,
+			"decision_source must be %q or %q",
+			DecisionSourceAutomatic,
+			DecisionSourceManual,
+		)
+	}
+	switch input.DecisionSource {
+	case DecisionSourceManual:
+		if input.ManualOffsetMS == nil {
+			return NewError(
+				"invalid_request",
+				400,
+				"manual_offset_ms is required when decision_source is %q",
+				DecisionSourceManual,
+			)
+		}
+		if absOffset(*input.ManualOffsetMS) > MaxCorrectionMS {
+			return NewError(
+				"invalid_request",
+				400,
+				"manual_offset_ms must be between -%d and %d",
+				MaxCorrectionMS,
+				MaxCorrectionMS,
+			)
+		}
+	case DecisionSourceAutomatic:
+		if input.ManualOffsetMS != nil {
+			return NewError(
+				"invalid_request",
+				400,
+				"manual_offset_ms is only allowed when decision_source is %q",
+				DecisionSourceManual,
+			)
+		}
+	}
 	return nil
+}
+
+func absOffset(value int) int {
+	if value < 0 {
+		return -value
+	}
+	return value
 }

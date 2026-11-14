@@ -65,10 +65,15 @@ type ConformJob struct {
 	AnalysisID        string    `json:"analysis_id"`
 	TakeID            string    `json:"take_id"`
 	State             string    `json:"state"`
+	DecisionSource    string    `json:"decision_source"`
 	MaxCorrectionMS   int       `json:"max_correction_ms"`
 	MeasuredOffsetMS  int       `json:"measured_offset_ms"`
+	ManualOffsetMS    *int      `json:"manual_offset_ms,omitempty"`
+	DecidedOffsetMS   int       `json:"decided_offset_ms"`
 	AppliedOffsetMS   int       `json:"applied_offset_ms"`
 	AppliedSamples    int       `json:"applied_samples"`
+	InputAudioDigest  string    `json:"input_audio_digest"`
+	InputVideoDigest  string    `json:"input_video_digest"`
 	AudioOutputDigest string    `json:"audio_output_digest,omitempty"`
 	VideoOutputDigest string    `json:"video_output_digest,omitempty"`
 	BundleDigest      string    `json:"bundle_digest,omitempty"`
@@ -84,7 +89,10 @@ type ConformReceipt struct {
 	ConformID        string    `json:"conform_id"`
 	AnalysisID       string    `json:"analysis_id"`
 	TakeID           string    `json:"take_id"`
+	DecisionSource   string    `json:"decision_source"`
 	MeasuredOffsetMS int       `json:"measured_offset_ms"`
+	ManualOffsetMS   *int      `json:"manual_offset_ms,omitempty"`
+	DecidedOffsetMS  int       `json:"decided_offset_ms"`
 	AppliedOffsetMS  int       `json:"applied_offset_ms"`
 	AppliedSamples   int       `json:"applied_samples"`
 	AudioDigest      string    `json:"audio_digest"`
@@ -110,6 +118,8 @@ type CreateAnalysisInput struct {
 type CreateConformInput struct {
 	ConformID       string
 	MaxCorrectionMS int
+	DecisionSource  string
+	ManualOffsetMS  *int
 }
 
 type TakeResult struct {
